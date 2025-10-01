@@ -30,6 +30,7 @@ class ImportLogsCommand extends ConsoleCommand
         $this->addOptionalValueOption('limit', null, 'Max number of lines to process', null);
         $this->addOptionalValueOption('sleep-us', null, 'Microseconds to sleep between requests', 0);
         $this->addNoValueOption('debug', null, 'Verbose debug output');
+        $this->addNoValueOption('log-requests', null, 'Log each tracking request and response (redacted)');
     }
 
     protected function doExecute(): int
@@ -57,6 +58,7 @@ class ImportLogsCommand extends ConsoleCommand
         $preferPost = (bool) $input->getOption('prefer-post');
         $noXff = (bool) $input->getOption('no-xff');
         $noFallback = (bool) $input->getOption('no-fallback');
+        $logRequests = (bool) $input->getOption('log-requests');
 
         if (!is_readable($logFile)) {
             throw new \InvalidArgumentException('Log file not readable: ' . $logFile);
@@ -184,10 +186,7 @@ class ImportLogsCommand extends ConsoleCommand
             $finalUrl = $trackingUrl . '?' . $queryString;
 
             if ($dryRun) {
-                $printUrl = $finalUrl;
-                if (isset($params['token_auth'])) {
-                    $printUrl = preg_replace('/(token_auth=)[^&]+/','${1}***', $printUrl);
-                }
+                $printUrl = $this->redactSensitive($finalUrl);
                 $output->writeln(($dryRun ? '[DRY] ' : '') . $printUrl);
             }
 
@@ -200,9 +199,23 @@ class ImportLogsCommand extends ConsoleCommand
                 if ($hasToken && !$stripAuthFields && !$noXff && !empty($entry['ip'])) {
                     $headers[] = 'X-Forwarded-For: ' . $entry['ip'];
                 }
-                $status = $preferPost
+                if ($logRequests) {
+                    $this->logRequest('PRIMARY', $preferPost ? 'POST' : 'GET', $preferPost ? $trackingUrl : $finalUrl, $headers, $preferPost ? $this->redactSensitive($queryString) : null);
+                }
+                $resp = $preferPost
                     ? $this->sendPost($trackingUrl, $queryString, $headers)
                     : $this->sendGet($finalUrl, $headers);
+                $status = (int)($resp['status'] ?? 0);
+                if ($logRequests) {
+                    $this->logResponse('PRIMARY', $status, $resp['body'] ?? '', $resp['error'] ?? null, (int)($resp['errno'] ?? 0));
+                }
+                if ($status >= 400 || (($resp['errno'] ?? 0) !== 0)) {
+                    $summaryUrl = $this->redactSensitive($preferPost ? $trackingUrl : $finalUrl);
+                    $this->getOutput()->writeln('[error] PRIMARY request failed: status=' . $status . ', errno=' . (int)($resp['errno'] ?? 0) . ', url=' . $summaryUrl);
+                    if (!empty($resp['body'])) {
+                        $this->getOutput()->writeln('[error] Response body: ' . $this->shorten($this->redactSensitive((string)$resp['body'])));
+                    }
+                }
 
                 // Fallback: if request failed and we used cip/cdt/token, retry once with safer params
                 if ((int)$status >= 400 && !$noFallback) {
@@ -222,9 +235,23 @@ class ImportLogsCommand extends ConsoleCommand
                             'User-Agent: ' . ($entry['user_agent'] ?? 'CustomImporter/1.0'),
                             'Referer: ' . ($entry['referer'] ?? ''),
                         ];
-                        $preferPost
+                        if ($logRequests) {
+                            $this->logRequest('RETRY', $preferPost ? 'POST' : 'GET', $preferPost ? $trackingUrl : $retryUrl, $retryHeaders, $preferPost ? $this->redactSensitive($retryQuery) : null);
+                        }
+                        $retryResp = $preferPost
                             ? $this->sendPost($trackingUrl, $retryQuery, $retryHeaders)
                             : $this->sendGet($retryUrl, $retryHeaders);
+                        if ($logRequests) {
+                            $this->logResponse('RETRY', (int)($retryResp['status'] ?? 0), $retryResp['body'] ?? '', $retryResp['error'] ?? null, (int)($retryResp['errno'] ?? 0));
+                        }
+                        $retryStatus = (int)($retryResp['status'] ?? 0);
+                        if ($retryStatus >= 400 || (($retryResp['errno'] ?? 0) !== 0)) {
+                            $retryUrlSummary = $this->redactSensitive($preferPost ? $trackingUrl : $retryUrl);
+                            $this->getOutput()->writeln('[error] RETRY request failed: status=' . $retryStatus . ', errno=' . (int)($retryResp['errno'] ?? 0) . ', url=' . $retryUrlSummary);
+                            if (!empty($retryResp['body'])) {
+                                $this->getOutput()->writeln('[error] Retry response body: ' . $this->shorten($this->redactSensitive((string)$retryResp['body'])));
+                            }
+                        }
                     }
                 }
                 if ($sleepUs > 0) {
@@ -310,10 +337,17 @@ class ImportLogsCommand extends ConsoleCommand
         curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
         curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
         curl_setopt($ch, CURLOPT_HEADER, false);
-        curl_exec($ch);
+        $body = curl_exec($ch);
+        $errno = curl_errno($ch);
+        $error = $errno ? curl_error($ch) : null;
         $status = curl_getinfo($ch, CURLINFO_HTTP_CODE);
         curl_close($ch);
-        return $status;
+        return [
+            'status' => (int)$status,
+            'body' => $body !== false ? (string)$body : '',
+            'errno' => (int)$errno,
+            'error' => $error,
+        ];
     }
 
     private function sendPost($url, string $body, array $headers)
@@ -328,10 +362,56 @@ class ImportLogsCommand extends ConsoleCommand
         curl_setopt($ch, CURLOPT_TIMEOUT, 30);
         curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
         curl_setopt($ch, CURLOPT_HEADER, false);
-        curl_exec($ch);
+        $respBody = curl_exec($ch);
+        $errno = curl_errno($ch);
+        $error = $errno ? curl_error($ch) : null;
         $status = curl_getinfo($ch, CURLINFO_HTTP_CODE);
         curl_close($ch);
-        return $status;
+        return [
+            'status' => (int)$status,
+            'body' => $respBody !== false ? (string)$respBody : '',
+            'errno' => (int)$errno,
+            'error' => $error,
+        ];
+    }
+
+    private function redactSensitive(string $text)
+    {
+        // mask token_auth in query strings or URLs
+        $text = preg_replace('/(token_auth=)[^&]+/i', '$1***', $text);
+        // mask Authorization headers if ever included
+        $text = preg_replace('/(Authorization:\s*Bearer\s+)[^\s]+/i', '$1***', $text);
+        return $text;
+    }
+
+    private function shorten(string $text, int $max = 2000)
+    {
+        if (strlen($text) <= $max) {
+            return $text;
+        }
+        return substr($text, 0, $max) . '...';
+    }
+
+    private function logRequest(string $scope, string $method, string $url, array $headers, ?string $body = null)
+    {
+        $safeUrl = $this->redactSensitive($url);
+        $this->getOutput()->writeln('[request][' . $scope . '] ' . $method . ' ' . $safeUrl);
+        foreach ($headers as $h) {
+            $this->getOutput()->writeln('[request][' . $scope . '] H: ' . $this->redactSensitive($h));
+        }
+        if ($body !== null && $body !== '') {
+            $this->getOutput()->writeln('[request][' . $scope . '] B: ' . $this->shorten($body));
+        }
+    }
+
+    private function logResponse(string $scope, int $status, string $body, ?string $error, int $errno)
+    {
+        $this->getOutput()->writeln('[response][' . $scope . '] status=' . $status . ', errno=' . $errno . (
+            $error ? ', error=' . $error : ''
+        ));
+        if ($body !== '') {
+            $this->getOutput()->writeln('[response][' . $scope . '] B: ' . $this->shorten($this->redactSensitive($body)));
+        }
     }
 }
 

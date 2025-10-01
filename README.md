@@ -2,9 +2,14 @@
 
 This tool reads Apache access logs of Matomo tracking requests and replays them into Matomo's Tracking API, preserving original timestamps and IP (when allowed).
 
+# Install
+Rename the plugin folder to just CustomImporter
+
+
 ## Requirements
 - Run inside the Matomo container.
 - A valid `token_auth` is required for non-dry runs.
+
 
 ## Usage
 
